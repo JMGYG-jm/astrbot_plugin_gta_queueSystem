@@ -27,7 +27,7 @@
 | `max_queue_size` | int | 50 | 待命队列最大人数 |
 | `enable_auto_clear` | bool | false | 是否启用定时清空数据 |
 | `clear_time` | string | "23:59" | 清空数据时间（格式：HH:MM） |
-| `task_notify_message` | string | "有活儿了！{task_description}，请尽快回复确认" | 通知待命成员的消息模板 |
+| `task_notify_message` | string | "有活儿了！直接来⬆️吧⬇️！！" | 通知待命成员的消息模板 |
 | `queue_status_title` | string | "待命成员列表" | 显示队列状态时的标题 |
 | `waiting_label` | string | "待命中" | 待命成员的标签 |
 | `matched_label` | string | "已匹配" | 已匹配任务的成员标签 |
@@ -60,13 +60,6 @@
 - "任务=3"
 
 系统会自动匹配最早待命的成员，并@通知。
-
-#### 确认任务
-被@通知后，发送以下任意关键词确认接受任务：
-- `确认`
-- `收到`
-- `来了`
-- `好的`
 
 ### 🤖 指令系统
 
