@@ -1,15 +1,12 @@
 import datetime
 import asyncio
-import json
-import logging
 import re
-from typing import Dict, List, Optional, Any
+from typing import Dict, Any, List, Optional
 
 from astrbot.api.all import *
 from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api import logger
 import astrbot.api.message_components as Comp
-
-logger = logging.getLogger("astrbot_plugin_task_queue")
 
 @register("task_queue_plugin", "mogudunxy", "任务匹配系统", "1.0.0")
 class TaskQueuePlugin(Star):
@@ -18,24 +15,65 @@ class TaskQueuePlugin(Star):
         self.config = config or {}
         
         # 数据结构 - 按群ID存储
-        self.waiting_queues = {}      # {group_id: [user_id1, user_id2, ...]}
-        self.pending_tasks_queues = {} # {group_id: [{"desc": "任务描述", "publisher": "发布者ID", "time": timestamp}, ...]}
-        self.active_tasks = {}         # {group_id: {user_id: {"desc": task_desc, "start_time": timestamp}}}
+        self.waiting_queues: Dict[str, List[str]] = {}      # {group_id: [user_id1, user_id2, ...]}
+        self.pending_tasks_queues: Dict[str, List[Dict]] = {} # {group_id: [{"desc": "任务描述", "publisher": "发布者ID", "time": timestamp}, ...]}
+        self.active_tasks: Dict[str, Dict[str, Dict]] = {}   # {group_id: {user_id: {"desc": task_desc, "start_time": timestamp}}}
         
         # 配置参数
         self.auto_clear_enabled = self.config.get("auto_clear_enabled", False)
         self.clear_time = self.config.get("clear_time", "23:59")
-        self.queue_timeout = self.config.get("queue_timeout", 1200)
-        self.task_timeout = self.config.get("task_timeout", 1200)
+        self.queue_timeout = self.config.get("queue_timeout", 1200)  # 20分钟
+        self.task_timeout = self.config.get("task_timeout", 7200)    # 2小时
+        self.admin_ids = self.config.get("admin_ids", [])            # 管理员ID列表
+        
+        # 后台任务引用
+        self._clear_task: Optional[asyncio.Task] = None
+        self._timeout_task: Optional[asyncio.Task] = None
         
         logger.info("多群独立任务匹配系统初始化完成")
         
-        # 启动定时清除任务
-        if self.auto_clear_enabled:
-            asyncio.create_task(self._daily_clear())
+        # 启动后台任务
+        self._start_background_tasks()
+    
+    def _start_background_tasks(self):
+        """启动后台任务"""
+        if self.auto_clear_enabled and (self._clear_task is None or self._clear_task.done()):
+            self._clear_task = asyncio.create_task(self._daily_clear())
+            logger.info(f"每日清理任务已启动，清理时间: {self.clear_time}")
         
-        # 启动超时检查任务
-        asyncio.create_task(self._timeout_checker())
+        if self._timeout_task is None or self._timeout_task.done():
+            self._timeout_task = asyncio.create_task(self._timeout_checker())
+            logger.info("超时检查任务已启动")
+    
+    async def terminate(self):
+        """插件卸载时的清理方法"""
+        logger.info("正在关闭任务队列插件...")
+        
+        # 取消后台任务
+        if self._clear_task and not self._clear_task.done():
+            self._clear_task.cancel()
+            try:
+                await self._clear_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error(f"取消每日清理任务时出错: {e}")
+        
+        if self._timeout_task and not self._timeout_task.done():
+            self._timeout_task.cancel()
+            try:
+                await self._timeout_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error(f"取消超时检查任务时出错: {e}")
+        
+        # 清理数据
+        self.waiting_queues.clear()
+        self.pending_tasks_queues.clear()
+        self.active_tasks.clear()
+        
+        logger.info("任务队列插件已关闭")
     
     def _is_task_message(self, message: str) -> bool:
         """
@@ -43,30 +81,96 @@ class TaskQueuePlugin(Star):
         格式要求：任务名=数字 或 任务名等数字
         例如：副本=1、带刷深渊-2、帮忙=3
         """
-        # 使用正则表达式匹配：任意文字 + [=-] + 数字(1-5)
-        pattern = r'.+[=\等][1-5]$'
+        # 使用正则表达式匹配：任意文字 + [=-等] + 数字(1-5)
+        pattern = r'.+[=\-等][1-5]$'
         return bool(re.match(pattern, message.strip()))
+    
+    def _is_finish_message(self, message: str) -> bool:
+        """判断是否是完成任务的消息"""
+        finish_patterns = [
+            r'^完成$',
+            r'^任务完成$',
+            r'^干完了$',
+            r'^结束任务$',
+            r'^我完成了$',
+            r'^搞定$'
+        ]
+        return any(re.match(pattern, message.strip()) for pattern in finish_patterns)
     
     def _get_user_id(self, event: AstrMessageEvent) -> str:
         """获取用户ID"""
-        if hasattr(event, 'user_id'):
-            return str(event.user_id)
-        elif hasattr(event, 'get_sender_id'):
-            return str(event.get_sender_id())
-        else:
+        try:
+            if hasattr(event, 'get_sender_id'):
+                return str(event.get_sender_id())
+            elif hasattr(event, 'user_id'):
+                return str(event.user_id)
+            else:
+                return "unknown"
+        except Exception as e:
+            logger.error(f"获取用户ID失败: {e}")
             return "unknown"
     
-    def _get_group_id(self, event: AstrMessageEvent) -> str:
+    def _get_group_id(self, event: AstrMessageEvent) -> Optional[str]:
         """获取群组ID"""
         if event.is_private_chat():
-            return None  # 私聊不支持
-        
-        if hasattr(event, 'group_id'):
-            return str(event.group_id)
-        elif hasattr(event, 'get_group_id'):
-            return str(event.get_group_id())
-        else:
             return None
+        
+        try:
+            if hasattr(event, 'get_group_id'):
+                return str(event.get_group_id())
+            elif hasattr(event, 'group_id'):
+                return str(event.group_id)
+            else:
+                return None
+        except Exception as e:
+            logger.error(f"获取群组ID失败: {e}")
+            return None
+    
+    async def _check_admin(self, event: AstrMessageEvent, group_id: str) -> bool:
+        """检查用户是否为管理员"""
+        user_id = self._get_user_id(event)
+        
+        # 检查是否为配置的管理员
+        if user_id in self.admin_ids:
+            return True
+        
+        # 检查是否为群管理员
+        try:
+            if hasattr(event, 'is_admin'):
+                return event.is_admin()
+        except Exception as e:
+            logger.error(f"检查管理员权限失败: {e}")
+        
+        return False
+    
+    async def _ensure_group_data(self, group_id: str) -> bool:
+        """确保群组数据结构存在，返回是否为新创建的群"""
+        if group_id is None:
+            return False
+        
+        created = False
+        if group_id not in self.waiting_queues:
+            self.waiting_queues[group_id] = []
+            created = True
+        if group_id not in self.pending_tasks_queues:
+            self.pending_tasks_queues[group_id] = []
+            created = True
+        if group_id not in self.active_tasks:
+            self.active_tasks[group_id] = {}
+            created = True
+        
+        return created
+    
+    def _clean_empty_group(self, group_id: str):
+        """清理空数据的群组"""
+        if group_id in self.waiting_queues and not self.waiting_queues[group_id]:
+            del self.waiting_queues[group_id]
+        
+        if group_id in self.pending_tasks_queues and not self.pending_tasks_queues[group_id]:
+            del self.pending_tasks_queues[group_id]
+        
+        if group_id in self.active_tasks and not self.active_tasks[group_id]:
+            del self.active_tasks[group_id]
     
     async def _daily_clear(self):
         """每日定时静默清除所有群的所有队列"""
@@ -84,6 +188,11 @@ class TaskQueuePlugin(Star):
                 
                 await asyncio.sleep(wait_seconds)
                 
+                # 检查auto_clear_enabled是否还在启用状态
+                if not self.auto_clear_enabled:
+                    logger.info("每日清理任务已禁用，退出循环")
+                    break
+                
                 # 执行清除（所有群）
                 total_count = 0
                 for group_id in list(self.waiting_queues.keys()):
@@ -99,15 +208,18 @@ class TaskQueuePlugin(Star):
                 
                 logger.info(f"定时清除执行完毕，移除了 {total_count} 个队列项")
                 
+            except asyncio.CancelledError:
+                logger.info("每日清理任务被取消")
+                break
             except Exception as e:
-                logger.error(f"定时清除任务出错: {e}")
+                logger.error(f"定时清除任务出错: {e}", exc_info=True)
                 await asyncio.sleep(60)
     
     async def _timeout_checker(self):
         """定期检查超时的队列成员和任务（按群）"""
         while True:
             try:
-                await asyncio.sleep(60)
+                await asyncio.sleep(60)  # 每分钟检查一次
                 
                 now = datetime.datetime.now().timestamp()
                 total_removed = 0
@@ -119,7 +231,11 @@ class TaskQueuePlugin(Star):
                         t for t in tasks 
                         if now - datetime.datetime.fromisoformat(t["time"]).timestamp() < self.queue_timeout
                     ]
-                    total_removed += before_count - len(self.pending_tasks_queues[group_id])
+                    removed = before_count - len(self.pending_tasks_queues[group_id])
+                    total_removed += removed
+                    
+                    if removed > 0:
+                        logger.debug(f"群{group_id}移除了 {removed} 个超时待匹配任务")
                     
                     # 如果群的任务列表为空，删除这个群的记录
                     if not self.pending_tasks_queues[group_id]:
@@ -136,6 +252,9 @@ class TaskQueuePlugin(Star):
                         del self.active_tasks[group_id][user_id]
                         total_removed += 1
                     
+                    if expired_tasks:
+                        logger.debug(f"群{group_id}移除了 {len(expired_tasks)} 个超时进行中任务")
+                    
                     # 如果群的任务列表为空，删除这个群的记录
                     if not self.active_tasks[group_id]:
                         del self.active_tasks[group_id]
@@ -143,22 +262,30 @@ class TaskQueuePlugin(Star):
                 if total_removed > 0:
                     logger.info(f"超时清理: 静默移除了 {total_removed} 个过期项")
                     
+            except asyncio.CancelledError:
+                logger.info("超时检查任务被取消")
+                break
             except Exception as e:
-                logger.error(f"超时检查出错: {e}")
+                logger.error(f"超时检查出错: {e}", exc_info=True)
                 await asyncio.sleep(60)
     
     @filter.command_group("task")
-    def task(self):
+    def task(self, event: AstrMessageEvent):
+        """任务系统命令组"""
         pass
     
     @task.command("status")
     async def task_status(self, event: AstrMessageEvent):
         """查看状态"""
         if event.is_private_chat():
-            yield event.plain_result("此功能仅在群聊中可用")
+            yield event.plain_result("❌ 此功能仅在群聊中可用")
             return
         
         group_id = self._get_group_id(event)
+        if group_id is None:
+            yield event.plain_result("❌ 无法获取群组信息")
+            return
+        
         user_id = self._get_user_id(event)
         
         # 检查是否在待命队列
@@ -203,18 +330,20 @@ class TaskQueuePlugin(Star):
     async def task_leave(self, event: AstrMessageEvent):
         """退出队列"""
         if event.is_private_chat():
-            yield event.plain_result("此功能仅在群聊中可用")
+            yield event.plain_result("❌ 此功能仅在群聊中可用")
             return
         
         group_id = self._get_group_id(event)
+        if group_id is None:
+            yield event.plain_result("❌ 无法获取群组信息")
+            return
+        
         user_id = self._get_user_id(event)
         left = False
         
         # 从待命队列移除
         if group_id in self.waiting_queues and user_id in self.waiting_queues[group_id]:
             self.waiting_queues[group_id].remove(user_id)
-            if not self.waiting_queues[group_id]:
-                del self.waiting_queues[group_id]
             left = True
         
         # 从待匹配任务移除
@@ -225,15 +354,14 @@ class TaskQueuePlugin(Star):
             ]
             if len(self.pending_tasks_queues[group_id]) < before_count:
                 left = True
-            if not self.pending_tasks_queues[group_id]:
-                del self.pending_tasks_queues[group_id]
         
         # 从进行中任务移除
         if group_id in self.active_tasks and user_id in self.active_tasks[group_id]:
             del self.active_tasks[group_id][user_id]
-            if not self.active_tasks[group_id]:
-                del self.active_tasks[group_id]
             left = True
+        
+        # 清理空群组
+        self._clean_empty_group(group_id)
         
         if left:
             yield event.plain_result("✅ 您已退出本群所有队列")
@@ -244,10 +372,18 @@ class TaskQueuePlugin(Star):
     async def task_clear(self, event: AstrMessageEvent):
         """清空当前群的所有队列（管理员）"""
         if event.is_private_chat():
-            yield event.plain_result("此功能仅在群聊中可用")
+            yield event.plain_result("❌ 此功能仅在群聊中可用")
             return
         
         group_id = self._get_group_id(event)
+        if group_id is None:
+            yield event.plain_result("❌ 无法获取群组信息")
+            return
+        
+        # 权限检查
+        if not await self._check_admin(event, group_id):
+            yield event.plain_result("❌ 权限不足，需要管理员权限")
+            return
         
         before_count = 0
         if group_id in self.waiting_queues:
@@ -266,20 +402,28 @@ class TaskQueuePlugin(Star):
     async def task_list(self, event: AstrMessageEvent):
         """查看本群队列状态"""
         if event.is_private_chat():
-            yield event.plain_result("此功能仅在群聊中可用")
+            yield event.plain_result("❌ 此功能仅在群聊中可用")
             return
         
         group_id = self._get_group_id(event)
+        if group_id is None:
+            yield event.plain_result("❌ 无法获取群组信息")
+            return
         
         waiting_count = len(self.waiting_queues.get(group_id, []))
         pending_count = len(self.pending_tasks_queues.get(group_id, []))
         active_count = len(self.active_tasks.get(group_id, {}))
         
+        # 获取超时时间配置（分钟）
+        queue_timeout_min = self.queue_timeout // 60
+        task_timeout_min = self.task_timeout // 60
+        
         yield event.plain_result(
             f"📋 本群待命人员：{waiting_count}人\n"
             f"📢 本群待匹配任务：{pending_count}个\n"
             f"✅ 本群进行中任务：{active_count}个\n"
-            f"⏰ 定时清除：{'开启' if self.auto_clear_enabled else '关闭'} ({self.clear_time})"
+            f"⏰ 待命超时：{queue_timeout_min}分钟 | 任务超时：{task_timeout_min}分钟\n"
+            f"🕐 定时清除：{'开启' if self.auto_clear_enabled else '关闭'} ({self.clear_time})"
         )
     
     @task.command("set_clear")
@@ -289,13 +433,44 @@ class TaskQueuePlugin(Star):
             yield event.plain_result("请指定清除时间，例如：/task set_clear 23:59")
             return
         
+        group_id = self._get_group_id(event)
+        if group_id is None and not event.is_private_chat():
+            yield event.plain_result("❌ 无法获取群组信息")
+            return
+        
+        # 权限检查（私聊需要是管理员，群聊需要群管理员）
+        if not await self._check_admin(event, group_id or ""):
+            yield event.plain_result("❌ 权限不足，需要管理员权限")
+            return
+        
         try:
+            # 验证时间格式
             datetime.datetime.strptime(time, "%H:%M")
             self.clear_time = time
-            self.auto_clear_enabled = True
+            
+            if not self.auto_clear_enabled:
+                self.auto_clear_enabled = True
+                self._start_background_tasks()  # 确保任务启动
+            
             yield event.plain_result(f"✅ 已设置定时清除时间为每天 {time}（静默清除）")
-        except:
+        except ValueError:
             yield event.plain_result("❌ 时间格式错误，请使用 HH:MM 格式，例如 23:59")
+    
+    @task.command("disable_clear")
+    async def task_disable_clear(self, event: AstrMessageEvent):
+        """禁用定时清除（管理员）"""
+        group_id = self._get_group_id(event)
+        if group_id is None and not event.is_private_chat():
+            yield event.plain_result("❌ 无法获取群组信息")
+            return
+        
+        # 权限检查
+        if not await self._check_admin(event, group_id or ""):
+            yield event.plain_result("❌ 权限不足，需要管理员权限")
+            return
+        
+        self.auto_clear_enabled = False
+        yield event.plain_result("✅ 已禁用定时清除功能")
     
     @event_message_type(EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
@@ -310,21 +485,21 @@ class TaskQueuePlugin(Star):
                 return
             
             group_id = self._get_group_id(event)
+            if group_id is None:
+                logger.warning("无法获取群组ID，忽略消息")
+                return
+            
             user_id = self._get_user_id(event)
             
-            logger.info(f"收到消息 - 群:{group_id} 用户:{user_id} 内容:{message}")
-            
-            # 初始化本群的数据结构
-            if group_id not in self.waiting_queues:
-                self.waiting_queues[group_id] = []
-            if group_id not in self.pending_tasks_queues:
-                self.pending_tasks_queues[group_id] = []
-            if group_id not in self.active_tasks:
-                self.active_tasks[group_id] = {}
+            logger.debug(f"收到消息 - 群:{group_id} 用户:{user_id} 内容:{message}")
             
             # ===== 1. 有人找活干（加入待命队列）- 严格匹配 =====
-            join_keywords = ["找活干", "有无活", "有没有活", "🈶🈚🔥", "有无🔥", "🈶🈚活", "有无", "🈶🈚", "🈶无", "有🈚️","有活吗","有🔥吗","🈶🔥吗","🈶活吗"]
+            join_keywords = ["找活干", "有无活", "有没有活", "🈶🈚🔥", "有无🔥", "🈶🈚活", 
+                            "有无", "🈶🈚", "🈶无", "有🈚️", "有活吗", "有🔥吗", "🈶🔥吗", "🈶活吗"]
             if message.strip() in join_keywords:
+                # 确保群数据结构存在
+                await self._ensure_group_data(group_id)
+                
                 # 先检查本群是否有待匹配的任务
                 if self.pending_tasks_queues[group_id]:
                     # 有任务在等待，直接匹配
@@ -352,6 +527,10 @@ class TaskQueuePlugin(Star):
                     ]
                     yield event.chain_result(chain2)
                     
+                    # 清理空任务列表
+                    if not self.pending_tasks_queues[group_id]:
+                        del self.pending_tasks_queues[group_id]
+                    
                     logger.info(f"群{group_id}任务匹配成功: 任务 {task['desc']} 由 {user_id} 接单")
                     return
                 
@@ -362,12 +541,15 @@ class TaskQueuePlugin(Star):
                 
                 self.waiting_queues[group_id].append(user_id)
                 position = len(self.waiting_queues[group_id])
-                yield event.plain_result(f"✅ 您已加入待等待队列，当前第 {position} 位，20分钟内如果有任务的话就骚扰你")
+                yield event.plain_result(f"✅ 您已加入等待队列，当前第 {position} 位，20分钟内如果有任务的话就骚扰你")
                 return
             
             # ===== 2. 有人发布任务（严格匹配格式）=====
             if self._is_task_message(message):
                 logger.info(f"群{group_id}检测到任务发布: {message}")
+                
+                # 确保群数据结构存在
+                await self._ensure_group_data(group_id)
                 
                 # 先检查本群是否有待命的人
                 if self.waiting_queues[group_id]:
@@ -396,6 +578,10 @@ class TaskQueuePlugin(Star):
                     ]
                     yield event.chain_result(chain2)
                     
+                    # 清理空队列
+                    if not self.waiting_queues[group_id]:
+                        del self.waiting_queues[group_id]
+                    
                     logger.info(f"群{group_id}任务匹配成功: {message} 由 {worker} 接单")
                     return
                 
@@ -419,15 +605,28 @@ class TaskQueuePlugin(Star):
                 return
             
             # ===== 3. 完成任务 =====
-            if any(kw in message for kw in ["完成", "干完了", "结束"]):
+            if self._is_finish_message(message):
+                # 确保群数据结构存在
+                await self._ensure_group_data(group_id)
+                
                 if user_id in self.active_tasks[group_id]:
                     task_info = self.active_tasks[group_id].pop(user_id)
                     elapsed = datetime.datetime.now().timestamp() - task_info["start_time"]
                     minutes = int(elapsed / 60)
+                    
+                    # 清理空任务列表
+                    if not self.active_tasks[group_id]:
+                        del self.active_tasks[group_id]
+                    
                     yield event.plain_result(f"✅ 任务完成：{task_info['desc']}\n耗时：{minutes}分钟\n辛苦了！")
                     return
             
+        except KeyError as e:
+            logger.error(f"数据键错误: {e}", exc_info=True)
+        except ValueError as e:
+            logger.error(f"值错误: {e}", exc_info=True)
+        except asyncio.CancelledError:
+            # 正常取消，不记录为错误
+            pass
         except Exception as e:
-            logger.error(f"处理消息出错: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f"处理消息时未预期的错误: {e}", exc_info=True)
