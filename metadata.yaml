@@ -1,6 +1,6 @@
 name: astrbot_plugin_gta_queueSystem # 插件唯一识别名
 display_name: 组队系统 # 用于展示的名字
-desc: 一个功能完整的GTA组队系统插件,支持没活找活,有活找人. # 插件简短描述
+desc: 任务组队插件为AstrBot打造自动化排队匹配系统。用户发送“有无活”一键待命，发布任务时输入“=1”自动匹配最早待命成员并@通知。支持多群独立管理、超时自动重配、权限控制和数据持久化。适用于游戏组队、任务分配等场景，让组队效率翻倍。 # 插件简短描述
 version: v1.0 # 插件版本号。格式：v1.1.1 或者 v1.1
-author: JMGYG # 作者
+author: JMGYG_ # 作者
 repo: https://github.com/JMGYG-jm/astrbot_plugin_gta_queueSystem # 插件的仓库地址
