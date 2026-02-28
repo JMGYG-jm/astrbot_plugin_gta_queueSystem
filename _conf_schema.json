@@ -1,0 +1,26 @@
+{
+    "max_queue_size": {
+        "description": "队列最大人数",
+        "type": "int",
+        "default": 50,
+        "hint": "每个群聊待命队列的最大容量"
+    },
+    "match_timeout": {
+        "description": "匹配超时时间",
+        "type": "int",
+        "default": 300,
+        "hint": "匹配后等待确认的秒数"
+    },
+    "allow_rematch": {
+        "description": "允许重复待命",
+        "type": "bool",
+        "default": true,
+        "hint": "是否允许已完成任务的用户再次待命"
+    },
+    "admin_users": {
+        "description": "管理员用户ID",
+        "type": "list",
+        "default": [],
+        "hint": "可以执行清空等操作的管理员"
+    }
+}

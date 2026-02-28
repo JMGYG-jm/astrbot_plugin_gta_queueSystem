@@ -1,0 +1,6 @@
+name: astrbot_plugin_queue_system # 插件唯一识别名
+display_name: 排队系统 # 用于展示的名字
+desc: 一个功能完整的排队系统插件，支持加入队列、退出队列等功能。 # 插件简短描述
+version: v1.2.0 # 插件版本号。格式：v1.1.1 或者 v1.1
+author: mogudunxy # 作者
+repo: https://github.com/mogudunxy/astrbot_plugin_queue_system # 插件的仓库地址
